@@ -1,0 +1,5 @@
+python-telegram-bot==20.7
+anthropic==0.21.3
+supabase==2.3.4
+matplotlib==3.8.2
+numpy==1.26.3
