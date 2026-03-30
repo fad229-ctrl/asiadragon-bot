@@ -224,13 +224,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await send_quick_dashboard(update.message)
             return
 
-        # Неизвестный — показываем диагностику
-        try:
-            r = supabase.table("staff").select("*").eq("telegram_id", int(uid)).execute().data
-            debug = f"uid={uid} | MANAGER_IDS={MANAGER_IDS} | staff={r}"
-        except Exception as de:
-            debug = f"uid={uid} | DB_error={de}"
-        await update.message.reply_text(f"⛔ Нет доступа\n\n`{debug}`", parse_mode="Markdown")
+        # Неизвестный пользователь
+        await update.message.reply_text("⛔ Нет доступа. Обратись к менеджеру.")
 
     except Exception as e:
         logging.error(f"Error in start for uid={uid}: {e}")
