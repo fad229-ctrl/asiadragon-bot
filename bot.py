@@ -21,31 +21,26 @@ logging.basicConfig(level=logging.INFO)
 
 # ─── Права доступа ───────────────────────────────────────────────
 def is_manager(uid):
-    # Если ALLOWED_USER_IDS задан — проверяем по списку
-    if MANAGER_IDS:
-        return uid in MANAGER_IDS
-    # Если не задан — менеджер тот кто НЕ в таблице staff
-    try:
-        r = supabase.table("staff").select("id").eq("telegram_id", uid).eq("is_active", True).execute().data
-        return not bool(r)
-    except:
-        return True  # при ошибке БД — считаем менеджером
+    if not MANAGER_IDS:
+        return True  # нет списка — все менеджеры
+    return int(uid) in MANAGER_IDS
 
 def is_worker(uid):
-    # Если пользователь в MANAGER_IDS — он не воркер
-    if MANAGER_IDS and uid in MANAGER_IDS:
+    if is_manager(uid):
         return False
     try:
-        r = supabase.table("staff").select("id").eq("telegram_id", uid).eq("is_active", True).execute().data
+        r = supabase.table("staff").select("id").eq("telegram_id", int(uid)).eq("is_active", True).execute().data
         return bool(r)
-    except:
+    except Exception as e:
+        logging.error(f"is_worker error: {e}")
         return False
 
 def get_staff(uid):
     try:
-        r = supabase.table("staff").select("*").eq("telegram_id", uid).eq("is_active", True).execute().data
+        r = supabase.table("staff").select("*").eq("telegram_id", int(uid)).eq("is_active", True).execute().data
         return r[0] if r else None
-    except:
+    except Exception as e:
+        logging.error(f"get_staff error: {e}")
         return None
 
 # ─── Форматирование ──────────────────────────────────────────────
@@ -907,6 +902,17 @@ async def add_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+async def remove_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_manager(update.effective_user.id): return
+    args = ctx.args
+    if not args: await update.message.reply_text("Использование: `/removestaff [telegram_id]`", parse_mode="Markdown"); return
+    try:
+        tg_id = int(args[0])
+        supabase.table("staff").update({"is_active": False}).eq("telegram_id", tg_id).execute()
+        await update.message.reply_text(f"✅ Сотрудник с ID `{tg_id}` деактивирован.", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 # ─── AI ──────────────────────────────────────────────────────────
 def load_full_context():
     from collections import defaultdict
@@ -1241,6 +1247,7 @@ async def run_bot():
     app.add_handler(CommandHandler("start",     start))
     app.add_handler(CommandHandler("stop",      stop))
     app.add_handler(CommandHandler("addstaff",  add_staff))
+    app.add_handler(CommandHandler("removestaff", remove_staff))
     app.add_handler(CommandHandler("dashboard", lambda u,c: send_quick_dashboard(u.message)))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
