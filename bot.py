@@ -20,7 +20,12 @@ ai       = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 logging.basicConfig(level=logging.INFO)
 
 # ─── Права доступа ───────────────────────────────────────────────
-def is_manager(uid): return not MANAGER_IDS or uid in MANAGER_IDS
+def is_manager(uid):
+    # Если список менеджеров не задан — все считаются менеджерами КРОМЕ зарегистрированных сотрудников
+    if not MANAGER_IDS:
+        worker = supabase.table("staff").select("id").eq("telegram_id", uid).eq("is_active", True).execute().data
+        return not bool(worker)
+    return uid in MANAGER_IDS
 
 def is_worker(uid):
     r = supabase.table("staff").select("id").eq("telegram_id", uid).eq("is_active", True).execute().data
@@ -37,6 +42,10 @@ def fmt(n, suffix="€"):
 
 def short(s, n=28): return s[:n]+"…" if len(str(s))>n else str(s)
 
+
+
+def back_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="dashboard")]])
 
 # ─── Языки / Sprachen / Ngôn ngữ ─────────────────────────────────
 LANG = {
@@ -170,30 +179,49 @@ def stock_level_chart(items):
 # ─── Главное меню ────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_manager(uid) and is_worker(uid):
-        st = get_staff(uid)
-        # Если язык ещё не выбран — спрашиваем
-        if not st.get("language"):
+    try:
+        # Сначала проверяем — сотрудник?
+        worker = is_worker(uid)
+        manager = is_manager(uid)
+
+        if worker and not manager:
+            # Это сотрудник — показываем его панель
+            st = get_staff(uid)
+            if not st:
+                await update.message.reply_text("❌ Ты не зарегистрирован. Обратись к менеджеру.")
+                return
+            # Если язык ещё не выбран
+            if not st.get("language"):
+                keyboard = [
+                    [InlineKeyboardButton("🇷🇺 Русский", callback_data="setlang_ru")],
+                    [InlineKeyboardButton("🇩🇪 Deutsch", callback_data="setlang_de")],
+                    [InlineKeyboardButton("🇻🇳 Tiếng Việt", callback_data="setlang_vi")],
+                ]
+                await update.message.reply_text(
+                    "👋 Привет! / Hallo! / Xin chào!\n\nВыбери язык / Sprache wählen / Chọn ngôn ngữ:",
+                    reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+            # Язык выбран — показываем меню сотрудника
             keyboard = [
-                [InlineKeyboardButton("🇷🇺 Русский", callback_data="setlang_ru")],
-                [InlineKeyboardButton("🇩🇪 Deutsch", callback_data="setlang_de")],
-                [InlineKeyboardButton("🇻🇳 Tiếng Việt", callback_data="setlang_vi")],
+                [InlineKeyboardButton(t(uid,"btn_order"), callback_data="worker_order")],
+                [InlineKeyboardButton(t(uid,"btn_myorders"), callback_data="worker_my_orders")],
             ]
             await update.message.reply_text(
-                "👋 Привет! / Hallo! / Xin chào!\n\nВыбери язык / Sprache wählen / Chọn ngôn ngữ:",
-                reply_markup=InlineKeyboardMarkup(keyboard))
+                t(uid, "welcome", name=st["name"]),
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
             return
-        # Язык уже выбран — показываем меню
-        keyboard = [
-            [InlineKeyboardButton(t(uid,"btn_order"), callback_data="worker_order")],
-            [InlineKeyboardButton(t(uid,"btn_myorders"), callback_data="worker_my_orders")],
-        ]
-        await update.message.reply_text(
-            t(uid, "welcome", name=st["name"]),
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-    if not is_manager(uid): return
-    await send_quick_dashboard(update.message)
+
+        if manager:
+            # Это менеджер — показываем дашборд
+            await send_quick_dashboard(update.message)
+            return
+
+        # Неизвестный пользователь
+        await update.message.reply_text("⛔ Нет доступа. Обратись к менеджеру.")
+
+    except Exception as e:
+        logging.error(f"Error in start for uid={uid}: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def send_quick_dashboard(msg):
     r  = supabase.table("stock").select("quantity,last_purchase_price,min_quantity").execute().data
@@ -246,7 +274,7 @@ async def stock_low(update, ctx):
         emoji = "🔴" if x["pct"]<30 else "🟡"
         caption += f"{emoji} *{short(x['name'])}*\n   {x['qty']:.1f}/{x['min']:.0f} {x['unit']} → _{x['lieferant']}_\n"
     if len(items)>8: caption += f"\n_...ещё {len(items)-8} товаров_"
-    await msg.reply_photo(buf, caption=caption, parse_mode="Markdown")
+    await msg.reply_photo(buf, caption=caption, parse_mode="Markdown", reply_markup=back_kb())
 
 # ─── Изменения цен ───────────────────────────────────────────────
 async def price_changes(update, ctx):
@@ -260,7 +288,7 @@ async def price_changes(update, ctx):
         text += f"{arrow} *{short(p.get(x['product_id'],'?'))}*\n"
         text += f"   {fmt(x['old_price'])} → {fmt(x['new_price'])} ({x['change_pct']:+.1f}%)\n"
         text += f"   _{x['lieferant_key']} | {x['price_date']}_\n"
-    await msg.reply_text(text, parse_mode="Markdown")
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=back_kb())
 
 # ─── Склад по группам ────────────────────────────────────────────
 async def stock_groups(update, ctx):
@@ -480,7 +508,7 @@ async def an_top_revenue(msg):
     top = sorted(agg.items(), key=lambda x: x[1], reverse=True)[:10]
     if not top: await msg.reply_text("Нет данных"); return
     buf = bar_chart([short(x[0]) for x in top], [x[1] for x in top], "💰 Топ 10 по выручке", "€", ACCENT, "€")
-    await msg.reply_photo(buf, caption="💰 *Топ 10 по выручке*", parse_mode="Markdown")
+    await msg.reply_photo(buf, caption="💰 *Топ 10 по выручке*", parse_mode="Markdown", reply_markup=back_kb())
 
 async def an_top_marge(msg):
     r = supabase.table("recipes_hauptspeisen").select("dish_name,sell_price,cost_per_portion").execute().data
@@ -488,7 +516,7 @@ async def an_top_marge(msg):
              for x in r if x["sell_price"] and x["cost_per_portion"] and float(x["sell_price"])>0]
     top = sorted(items, key=lambda x: x[1], reverse=True)[:10]
     buf = bar_chart([short(x[0]) for x in top], [x[1] for x in top], "💹 Топ 10 по марже", "%", GREEN, "%")
-    await msg.reply_photo(buf, caption="💹 *Топ 10 по марже*", parse_mode="Markdown")
+    await msg.reply_photo(buf, caption="💹 *Топ 10 по марже*", parse_mode="Markdown", reply_markup=back_kb())
 
 async def an_top_qty(msg):
     from collections import defaultdict
@@ -498,7 +526,7 @@ async def an_top_qty(msg):
     top = sorted(agg.items(), key=lambda x: x[1], reverse=True)[:10]
     if not top: await msg.reply_text("Нет данных"); return
     buf = bar_chart([short(x[0]) for x in top], [x[1] for x in top], "📈 Топ по количеству", "порций", BLUE, " пор.")
-    await msg.reply_photo(buf, caption="📈 *Топ по количеству*", parse_mode="Markdown")
+    await msg.reply_photo(buf, caption="📈 *Топ по количеству*", parse_mode="Markdown", reply_markup=back_kb())
 
 async def an_suppliers(msg):
     from collections import defaultdict
@@ -507,13 +535,13 @@ async def an_suppliers(msg):
     for x in r: agg[x["lieferant_name"]] += float(x.get("total_brutto") or x.get("total_netto") or 0)
     top = sorted(agg.items(), key=lambda x: x[1], reverse=True)[:8]
     buf = bar_chart([x[0] for x in top], [x[1] for x in top], "💰 Закупки по поставщикам", "€", BLUE, "€")
-    await msg.reply_photo(buf, caption="💰 *Закупки по поставщикам*", parse_mode="Markdown")
+    await msg.reply_photo(buf, caption="💰 *Закупки по поставщикам*", parse_mode="Markdown", reply_markup=back_kb())
 
 async def an_expensive(msg):
     r = supabase.table("recipes_hauptspeisen").select("dish_name,sell_price").order("sell_price", desc=True).limit(10).execute().data
     buf = bar_chart([short(x["dish_name"]) for x in r], [float(x["sell_price"]) for x in r],
                     "💸 Дорогие блюда", "€", ORANGE, "€")
-    await msg.reply_photo(buf, caption="💸 *Самые дорогие блюда*", parse_mode="Markdown")
+    await msg.reply_photo(buf, caption="💸 *Самые дорогие блюда*", parse_mode="Markdown", reply_markup=back_kb())
 
 async def an_price_up(msg):
     r = supabase.table("price_history").select("product_id,change_pct,old_price,new_price").gt("change_pct",0).order("change_pct",desc=True).limit(10).execute().data
@@ -521,7 +549,7 @@ async def an_price_up(msg):
     if not r: await msg.reply_text("📉 Подорожавших пока нет."); return
     buf = bar_chart([short(p.get(x["product_id"],"?")) for x in r], [float(x["change_pct"]) for x in r],
                     "📉 Подорожавшие ингредиенты", "%", RED, "%")
-    await msg.reply_photo(buf, caption="📉 *Подорожавшие ингредиенты*", parse_mode="Markdown")
+    await msg.reply_photo(buf, caption="📉 *Подорожавшие ингредиенты*", parse_mode="Markdown", reply_markup=back_kb())
 
 # ─── Закупки ─────────────────────────────────────────────────────
 async def purchases(update, ctx):
@@ -535,7 +563,7 @@ async def purchases(update, ctx):
     r2 = supabase.table("documents").select("total_brutto,total_netto").gte("doc_date",month_ago).execute().data
     month_sum = sum(float(x.get("total_brutto") or x.get("total_netto") or 0) for x in r2)
     text += f"\n💰 *За 30 дней: {fmt(month_sum)}*"
-    await msg.reply_text(text, parse_mode="Markdown")
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=back_kb())
 
 # ─── Сканирование чека + обновление склада ───────────────────────
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -689,7 +717,7 @@ async def save_receipt_and_update_stock(q, receipt):
 async def staff_orders_view(update, ctx):
     msg = update.message or update.callback_query.message
     r = supabase.table("order_requests").select("*").eq("status","pending").order("created_at",desc=True).execute().data
-    if not r: await msg.reply_text("✅ Нет новых заказов от сотрудников"); return
+    if not r: await msg.reply_text("✅ Нет новых заказов от сотрудников", reply_markup=back_kb()); return
 
     text = f"🔔 *Заказы сотрудников* ({len(r)} новых)\n━━━━━━━━━━━━━━━━━━━━\n"
     keyboard = []
@@ -853,7 +881,7 @@ async def manage_staff(update, ctx):
     for s in r:
         text += f"• *{s['name']}* (ID: `{s['telegram_id']}`)\n"
     text += "\n*Добавить:* `/addstaff [telegram_id] [имя]`\n*Удалить:* `/removestaff [telegram_id]`"
-    await msg.reply_text(text, parse_mode="Markdown")
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=back_kb())
 
 async def add_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_manager(update.effective_user.id): return
