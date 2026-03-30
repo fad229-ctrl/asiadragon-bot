@@ -21,19 +21,32 @@ logging.basicConfig(level=logging.INFO)
 
 # ─── Права доступа ───────────────────────────────────────────────
 def is_manager(uid):
-    # Если список менеджеров не задан — все считаются менеджерами КРОМЕ зарегистрированных сотрудников
-    if not MANAGER_IDS:
-        worker = supabase.table("staff").select("id").eq("telegram_id", uid).eq("is_active", True).execute().data
-        return not bool(worker)
-    return uid in MANAGER_IDS
+    # Если ALLOWED_USER_IDS задан — проверяем по списку
+    if MANAGER_IDS:
+        return uid in MANAGER_IDS
+    # Если не задан — менеджер тот кто НЕ в таблице staff
+    try:
+        r = supabase.table("staff").select("id").eq("telegram_id", uid).eq("is_active", True).execute().data
+        return not bool(r)
+    except:
+        return True  # при ошибке БД — считаем менеджером
 
 def is_worker(uid):
-    r = supabase.table("staff").select("id").eq("telegram_id", uid).eq("is_active", True).execute().data
-    return bool(r)
+    # Если пользователь в MANAGER_IDS — он не воркер
+    if MANAGER_IDS and uid in MANAGER_IDS:
+        return False
+    try:
+        r = supabase.table("staff").select("id").eq("telegram_id", uid).eq("is_active", True).execute().data
+        return bool(r)
+    except:
+        return False
 
 def get_staff(uid):
-    r = supabase.table("staff").select("*").eq("telegram_id", uid).eq("is_active", True).execute().data
-    return r[0] if r else None
+    try:
+        r = supabase.table("staff").select("*").eq("telegram_id", uid).eq("is_active", True).execute().data
+        return r[0] if r else None
+    except:
+        return None
 
 # ─── Форматирование ──────────────────────────────────────────────
 def fmt(n, suffix="€"):
