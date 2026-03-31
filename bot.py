@@ -256,7 +256,8 @@ async def send_quick_dashboard(msg):
          InlineKeyboardButton("🧾 Загрузить чек", callback_data="upload_receipt")],
         [InlineKeyboardButton("📉 Аналитика", callback_data="analytics"),
          InlineKeyboardButton("🤖 Спросить AI", callback_data="ask_ai")],
-        [InlineKeyboardButton("📋 Каталог поставщиков", callback_data="catalog")],
+        [InlineKeyboardButton("📋 Каталог поставщиков", callback_data="catalog"),
+         InlineKeyboardButton("🔍 Статус чеков",         callback_data="docs_status")],
         [InlineKeyboardButton("👥 Управление сотрудниками", callback_data="manage_staff")],
     ]
     await msg.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -614,15 +615,21 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка распознавания: {e}")
 
 async def save_receipt_and_update_stock(q, receipt):
-    """Сохраняет чек и обновляет склад"""
-    # 1. Сохраняем документ
+    """Сохраняет чек, запускает pipeline и обновляет склад"""
+    # 1. Сохраняем документ — включая raw_text и pipeline-колонки
+    raw_text = receipt.get("raw_text_original") or ""
     doc = supabase.table("documents").insert({
-        "lieferant_key": receipt["lieferant_key"],
-        "lieferant_name": receipt["lieferant_name"],
-        "doc_type": "Kassenbon",
-        "doc_date": receipt["doc_date"],
-        "bon_nr": receipt.get("bon_nr"),
-        "total_brutto": receipt.get("total_brutto"),
+        "lieferant_key":      receipt["lieferant_key"],
+        "lieferant_name":     receipt["lieferant_name"],
+        "doc_type":           "Kassenbon",
+        "doc_date":           receipt["doc_date"],
+        "bon_nr":             receipt.get("bon_nr"),
+        "total_brutto":       receipt.get("total_brutto"),
+        "raw_text":           raw_text,
+        "ocr_text":           raw_text,
+        "scan_source":        "telegram_photo",
+        "parsed_by":          "claude-sonnet-4-5",
+        "processing_status":  "pending",
     }).execute()
     doc_id = doc.data[0]["id"]
 
@@ -710,8 +717,21 @@ async def save_receipt_and_update_stock(q, receipt):
         else:
             not_found.append(f"❓ {short(item['raw_text'],25)}")
 
-    # 4. Формируем ответ
-    result = f"✅ *Чек сохранён!* ID: {doc_id}\n\n"
+    # 4. Запускаем pipeline process_document для валидации и логирования
+    try:
+        pipeline = supabase.rpc("process_document", {"p_document_id": doc_id}).execute()
+        pipeline_data = pipeline.data or {}
+        p_status     = pipeline_data.get("status", "?")
+        p_confidence = pipeline_data.get("confidence", 0)
+        pipeline_info = f"\n🔍 Pipeline: *{p_status}* (уверенность {p_confidence}%)"
+        if p_status == "needs_review":
+            pipeline_info += "\n⚠️ _Требует проверки — данные неполные_"
+    except Exception as pe:
+        pipeline_info = f"\n⚠️ Pipeline: {pe}"
+
+    # 5. Формируем ответ
+    result = f"✅ *Чек сохранён!* ID: {doc_id}\n"
+    result += pipeline_info + "\n\n"
     result += f"📦 *Склад обновлён ({len(updated)} позиций):*\n"
     result += "\n".join(updated[:10])
     if not_found:
@@ -1190,6 +1210,76 @@ async def worker_confirm_send(update, ctx):
         t(uid, "sent", id=order["id"], items=item_text),
         parse_mode="Markdown")
 
+
+# ─── Статус чеков / Pipeline ─────────────────────────────────────
+async def docs_status(update, ctx):
+    """Показывает статус обработки документов"""
+    msg = update.message or update.callback_query.message
+
+    # Статистика по статусам
+    docs = supabase.table("documents").select(
+        "id,lieferant_name,doc_date,processing_status,confidence,needs_review,total_brutto"
+    ).order("created_at", desc=True).limit(50).execute().data
+
+    from collections import Counter
+    statuses = Counter(d["processing_status"] or "unknown" for d in docs)
+
+    status_emoji = {
+        "parsed":       "✅",
+        "done":         "✅",
+        "needs_review": "⚠️",
+        "failed":       "🔴",
+        "pending":      "🔄",
+        "unknown":      "❓",
+    }
+
+    text = "📄 *Статус обработки чеков*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    for status, count in sorted(statuses.items()):
+        em = status_emoji.get(status, "❓")
+        text += f"{em} *{status}*: {count}\n"
+
+    # Последние требующие проверки
+    review = [d for d in docs if d["processing_status"] == "needs_review"]
+    failed = [d for d in docs if d["processing_status"] == "failed"]
+
+    if review:
+        text += f"\n⚠️ *Требуют проверки ({len(review)}):*\n"
+        for d in review[:3]:
+            conf = f"{int((d['confidence'] or 0)*100)}%" if d.get("confidence") else "—"
+            text += f"  • {d['lieferant_name']} {d['doc_date']} (conf: {conf})\n"
+
+    if failed:
+        text += f"\n🔴 *Ошибки ({len(failed)}):*\n"
+        for d in failed[:3]:
+            text += f"  • ID {d['id']} — {d['lieferant_name']} {d['doc_date']}\n"
+
+    keyboard = [
+        [InlineKeyboardButton("🔄 Переобработать failed",       callback_data="reprocess_failed")],
+        [InlineKeyboardButton("🔄 Переобработать needs_review", callback_data="reprocess_review")],
+        [InlineKeyboardButton("🏠 Главное меню",                callback_data="dashboard")],
+    ]
+    await msg.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def run_reprocess(q, status_filter):
+    """Запускает переобработку через SQL pipeline"""
+    await q.message.reply_text(f"🔄 Запускаю переобработку ({status_filter})...")
+    try:
+        result = supabase.rpc("reprocess_all_documents", {
+            "p_status_filter": status_filter,
+            "p_clear_items":   False
+        }).execute()
+        rows = result.data or []
+        ok      = sum(1 for r in rows if (r.get("result") or {}).get("status") in ["parsed","done"])
+        failed  = sum(1 for r in rows if (r.get("result") or {}).get("status") == "failed")
+        review  = sum(1 for r in rows if (r.get("result") or {}).get("status") == "needs_review")
+        await q.message.reply_text(
+            f"✅ *Переобработка завершена*\n\n"
+            f"✅ parsed: {ok}\n⚠️ needs_review: {review}\n🔴 failed: {failed}\n"
+            f"Всего: {len(rows)}",
+            parse_mode="Markdown", reply_markup=back_kb())
+    except Exception as e:
+        await q.message.reply_text(f"❌ Ошибка: {e}", reply_markup=back_kb())
+
 async def stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["ai_mode"] = False
     ctx.user_data["worker_ordering"] = False
@@ -1234,6 +1324,9 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(
             f"✅ {names[lang]}\n\n" + t(uid2, "welcome", name=st2["name"]),
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard2))
+    elif d == "docs_status":          await docs_status(update, ctx)
+    elif d == "reprocess_failed":     await run_reprocess(q, "failed")
+    elif d == "reprocess_review":     await run_reprocess(q, "needs_review")
     elif d == "catalog":              await catalog_menu(update, ctx)
     elif d == "cat_search":           await catalog_search_start(update, ctx)
     elif d == "cat_update_prices":    await catalog_update_prices_start(update, ctx)
