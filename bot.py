@@ -830,47 +830,34 @@ Rules:
         if not items:
             await update.message.reply_text("❌ Не смог разобрать список. Попробуй ещё раз."); return
 
-        order = supabase.table("order_requests").insert({
-            "requested_by": st["name"],
-            "staff_name":   st["name"],
-            "telegram_id":  uid,
-            "status":       "pending",
-            "order_date":   datetime.now().strftime("%Y-%m-%d"),
-            "notes":        f"Заказ через Telegram. Язык: {st.get('language','ru')}. Оригинал: {full_text[:150]}",
-        }).execute().data[0]
-
-        for it in items:
-            supabase.table("order_request_items").insert({
-                "order_request_id": order["id"],
-                "product_name":     it["name"],
-                "quantity":         it["qty"],
-                "unit":             it["unit"],
-            }).execute()
-
-        ctx.user_data["worker_ordering"] = False
-        ctx.user_data["worker_messages"] = []
-
+        # ── Показываем превью — сотрудник проверяет перед отправкой ──
         item_text = "\n".join([f"  • {it['name']} — {it['qty']} {it['unit']}" for it in items])
-        notify = (
-            f"🔔 *Новый заказ продуктов*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 *{st['name']}*\n"
-            f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-            f"📋 Заказ *#{order['id']}*\n\n"
-            f"*Список:*\n{item_text}"
-        )
-        for manager_id in MANAGER_IDS:
-            try:
-                await ctx.bot.send_message(manager_id, notify, parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_order_{order['id']}"),
-                        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_order_{order['id']}")
-                    ]]))
-            except: pass
 
+        # Сохраняем parsed items в user_data — отправим только после подтверждения
+        ctx.user_data["worker_pending_items"]    = items
+        ctx.user_data["worker_pending_messages"] = full_text
+
+        lang = st.get("language","ru") if st else "ru"
+        if lang == "de":
+            preview_text  = f"📋 *Deine Bestellung ({len(items)} Pos.):*\n\n{item_text}\n\nAlles richtig?"
+            btn_send      = "✅ Absenden"
+            btn_edit      = "✏️ Korrigieren"
+        elif lang == "vi":
+            preview_text  = f"📋 *Đơn hàng của bạn ({len(items)} món):*\n\n{item_text}\n\nĐúng không?"
+            btn_send      = "✅ Gửi đi"
+            btn_edit      = "✏️ Sửa lại"
+        else:
+            preview_text  = f"📋 *Твой заказ ({len(items)} позиций):*\n\n{item_text}\n\nВсё верно?"
+            btn_send      = "✅ Отправить менеджеру"
+            btn_edit      = "✏️ Исправить"
+
+        keyboard = [[
+            InlineKeyboardButton(btn_send, callback_data="worker_confirm_order"),
+            InlineKeyboardButton(btn_edit, callback_data="worker_edit_order"),
+        ]]
         await update.message.reply_text(
-            t(uid, "sent", id=order["id"], items=item_text),
-            parse_mode="Markdown")
+            preview_text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     # Накапливаем сообщения
@@ -1147,6 +1134,62 @@ def auto_match(report_id):
             count += 1
     return count
 
+
+async def worker_confirm_send(update, ctx):
+    """Сотрудник подтвердил заказ — отправляем менеджеру"""
+    q   = update.callback_query
+    uid = update.effective_user.id
+    st  = get_staff(uid)
+    items     = ctx.user_data.get("worker_pending_items", [])
+    full_text = ctx.user_data.get("worker_pending_messages","")
+
+    if not items:
+        await q.message.reply_text("❌ Заказ не найден. Начни заново."); return
+
+    order = supabase.table("order_requests").insert({
+        "requested_by": st["name"],
+        "staff_name":   st["name"],
+        "telegram_id":  uid,
+        "status":       "pending",
+        "order_date":   datetime.now().strftime("%Y-%m-%d"),
+        "notes":        f"Заказ через Telegram. Язык: {st.get('language','ru')}. Оригинал: {full_text[:150]}",
+    }).execute().data[0]
+
+    for it in items:
+        supabase.table("order_request_items").insert({
+            "order_request_id": order["id"],
+            "product_name":     it["name"],
+            "quantity":         it["qty"],
+            "unit":             it["unit"],
+        }).execute()
+
+    ctx.user_data["worker_ordering"]       = False
+    ctx.user_data["worker_messages"]       = []
+    ctx.user_data["worker_pending_items"]  = []
+    ctx.user_data["worker_pending_messages"] = ""
+
+    item_text = "\n".join([f"  • {it['name']} — {it['qty']} {it['unit']}" for it in items])
+    notify = (
+        f"🔔 *Новый заказ продуктов*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 *{st['name']}*\n"
+        f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+        f"📋 Заказ *#{order['id']}*\n\n"
+        f"*Список:*\n{item_text}"
+    )
+    for manager_id in MANAGER_IDS:
+        try:
+            await ctx.bot.send_message(manager_id, notify, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_order_{order['id']}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_order_{order['id']}")
+                ]]))
+        except: pass
+
+    await q.message.reply_text(
+        t(uid, "sent", id=order["id"], items=item_text),
+        parse_mode="Markdown")
+
 async def stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["ai_mode"] = False
     ctx.user_data["worker_ordering"] = False
@@ -1168,6 +1211,14 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d == "manage_staff":       await manage_staff(update, ctx)
     elif d == "worker_order":       await worker_order_start(update, ctx)
     elif d == "worker_my_orders":   await worker_my_orders(update, ctx)
+    elif d == "worker_confirm_order": await worker_confirm_send(update, ctx)
+    elif d == "worker_edit_order":
+        ctx.user_data["worker_ordering"]      = True
+        ctx.user_data["worker_messages"]      = []
+        ctx.user_data["worker_pending_items"] = []
+        uid2 = update.effective_user.id
+        await q.message.reply_text(
+            "✏️ Начни заново — напиши список продуктов:", parse_mode="Markdown")
     elif d == "upload_receipt":     await q.message.reply_text("📷 Отправь фото чека")
     elif d == "cancel":             await q.message.reply_text("❌ Отменено")
     elif d.startswith("setlang_"):
